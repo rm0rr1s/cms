@@ -1,0 +1,206 @@
+# syntax=docker.io/docker/dockerfile:1
+
+# This Dockerfile provides four stages: stage-base, stage-compile, stage-main and stage-final
+# This is in preparation for more granular stages (eg ClamAV and Fail2Ban split into their own)
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG DOVECOT_COMMUNITY_REPO=0
+ARG LOG_LEVEL=trace
+
+FROM docker.io/debian:12-slim AS stage-base
+
+ARG DEBIAN_FRONTEND
+ARG DOVECOT_COMMUNITY_REPO
+ARG LOG_LEVEL
+
+SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
+
+# -----------------------------------------------
+# --- Install Basic Software --------------------
+# -----------------------------------------------
+
+COPY target/bin/sedfile /usr/local/bin/sedfile
+
+RUN <<EOF
+  chmod +x /usr/local/bin/sedfile
+  adduser --quiet --system --group --disabled-password --home /var/lib/clamav --no-create-home --uid 200 clamav
+EOF
+
+COPY target/scripts/build/packages.sh /build/
+COPY target/scripts/helpers/log.sh /usr/local/bin/helpers/log.sh
+
+RUN /bin/bash /build/packages.sh && rm -r /build
+
+# -----------------------------------------------
+# --- Compile deb packages ----------------------
+# -----------------------------------------------
+
+FROM stage-base AS stage-compile
+
+ARG LOG_LEVEL
+ARG DEBIAN_FRONTEND
+
+COPY target/scripts/build/compile.sh /build/
+RUN /bin/bash /build/compile.sh
+
+#
+# main stage provides all packages, config, and adds scripts
+#
+
+FROM stage-base AS stage-main
+
+ARG DEBIAN_FRONTEND
+ARG LOG_LEVEL
+
+SHELL ["/bin/bash", "-e", "-o", "pipefail", "-c"]
+
+
+# -----------------------------------------------
+# --- ClamAV & FeshClam -------------------------
+# -----------------------------------------------
+
+# Copy over latest DB updates from official ClamAV image. This is better than running `freshclam`,
+# which would require an extra memory of 500MB+ during an image build.
+# When using `COPY --link`, the `--chown` option is only compatible with numeric ID values.
+# hadolint ignore=DL3021
+COPY --link --chown=200 --from=docker.io/clamav/clamav-debian:latest /var/lib/clamav /var/lib/clamav
+
+RUN <<EOF
+  # `COPY --link --chown=200` has a bug when built by the buildx docker-container driver.
+  # Restore ownership of parent dirs (Bug: https://github.com/moby/buildkit/issues/3912)
+  chown root:root /var /var/lib
+  echo '0 */6 * * * clamav /usr/bin/freshclam --quiet' >/etc/cron.d/clamav-freshclam
+  chmod 644 /etc/clamav/freshclam.conf
+  sedfile -i 's/Foreground false/Foreground true/g' /etc/clamav/clamd.conf
+  mkdir /var/run/clamav
+  chown -R clamav:root /var/run/clamav
+  rm -rf /var/log/clamav/
+EOF
+
+# -----------------------------------------------
+# --- Dovecot -----------------------------------
+# -----------------------------------------------
+
+# install fts_xapian plugin
+
+COPY --from=stage-compile dovecot-fts-xapian-*.deb /
+RUN dpkg -i /dovecot-fts-xapian-*.deb && rm /dovecot-fts-xapian-*.deb
+
+COPY target/dovecot/*.inc target/dovecot/*.conf /etc/dovecot/conf.d/
+COPY target/dovecot/dovecot-purge.cron /etc/cron.d/dovecot-purge.disabled
+RUN chmod 0 /etc/cron.d/dovecot-purge.disabled
+
+# -----------------------------------------------
+# --- Rspamd ------------------------------------
+# -----------------------------------------------
+
+COPY target/rspamd/local.d/ /etc/rspamd/local.d/
+
+# -----------------------------------------------
+# --- OAUTH2 ------------------------------------
+# -----------------------------------------------
+
+COPY target/dovecot/dovecot-oauth2.conf.ext /etc/dovecot
+COPY target/dovecot/auth-oauth2.conf.ext /etc/dovecot/conf.d
+
+# -----------------------------------------------
+# --- LDAP & SpamAssassin's Cron ----------------
+# -----------------------------------------------
+
+COPY target/dovecot/dovecot-ldap.conf.ext /etc/dovecot
+COPY target/dovecot/auth-ldap.conf.ext /etc/dovecot/conf.d
+COPY \
+  target/postfix/ldap-users.cf \
+  target/postfix/ldap-groups.cf \
+  target/postfix/ldap-aliases.cf \
+  target/postfix/ldap-domains.cf \
+  target/postfix/ldap-senders.cf \
+  /etc/postfix/
+
+# hadolint ignore=SC2016
+RUN <<EOF
+  # ref: https://github.com/docker-mailserver/docker-mailserver/pull/3403#discussion_r1306282387
+  echo 'CRON=1' >/etc/default/spamassassin
+  sedfile -i -r 's/^\$INIT restart/supervisorctl restart amavis/g' /etc/spamassassin/sa-update-hooks.d/amavisd-new
+  mkdir /etc/spamassassin/kam/
+  curl -sSfLo /etc/spamassassin/kam/kam.sa-channels.mcgrail.com.key https://mcgrail.com/downloads/kam.sa-channels.mcgrail.com.key
+EOF
+
+# -----------------------------------------------
+# --- PostSRSD, Postgrey & Amavis ---------------
+# -----------------------------------------------
+
+COPY target/postsrsd/postsrsd /etc/default/postsrsd
+COPY target/postgrey/postgrey /etc/default/postgrey
+RUN <<EOF
+  mkdir /var/run/postgrey
+  chown postgrey:postgrey /var/run/postgrey
+  curl -Lsfo /etc/postgrey/whitelist_clients https://raw.githubusercontent.com/schweikert/postgrey/master/postgrey_whitelist_clients
+EOF
+
+COPY target/amavis/conf.d/* /etc/amavis/conf.d/
+COPY target/amavis/postfix-amavis.cf /etc/dms/postfix/master.d/
+RUN <<EOF
+  sedfile -i -r 's/#(@|   \\%)bypass/\1bypass/g' /etc/amavis/conf.d/15-content_filter_mode
+  # add users clamav and amavis to each others group
+  adduser clamav amavis
+  adduser amavis clamav
+  # no syslog user in Debian compared to Ubuntu
+  adduser --system syslog
+  useradd -u 5000 -d /home/docker -s /bin/bash -p "$(echo docker | openssl passwd -1 -stdin)" docker
+  echo "0 4 * * * /usr/local/bin/virus-wiper" | crontab -
+  chmod 644 /etc/amavis/conf.d/*
+EOF
+
+# overcomplication necessary for CI
+# hadolint ignore=SC2086
+RUN <<EOF
+  for _ in {1..10}; do
+    su - amavis -c "razor-admin -create"
+    sleep 3
+    if su - amavis -c "razor-admin -register"; then
+      EC=0
+      break
+    else
+      EC=${?}
+    fi
+  done
+  exit ${EC}
+EOF
+
+# -----------------------------------------------
+# --- Fail2Ban, DKIM & DMARC --------------------
+# -----------------------------------------------
+
+    COPY target/fail2ban/jail.local /etc/fail2ban/jail.local
+COPY target/fail2ban/fail2ban.d/fixes.local /etc/fail2ban/fail2ban.d/fixes.local
+RUN <<EOF
+  ln -s  /var/log/mail/mail.log     /var/log/mail.log
+  ln -sf /var/log/mail/fail2ban.log /var/log/fail2ban.log
+EOF
+
+COPY target/opendkim/opendkim.conf /etc/opendkim.conf
+COPY target/opendkim/default-opendkim /etc/default/opendkim
+
+COPY target/opendmarc/opendmarc.conf /etc/opendmarc.conf
+COPY target/opendmarc/default-opendmarc /etc/default/opendmarc
+COPY target/opendmarc/ignore.hosts /etc/opendmarc/ignore.hosts
+
+# --------------------------------------------------
+# --- postfix-mta-sts-daemon -----------------------
+# --------------------------------------------------
+
+COPY target/mta-sts-daemon/mta-sts-daemon.yml /etc/mta-sts-daemon.yml
+RUN <<EOF
+  mkdir /var/run/mta-sts
+  chown -R _mta-sts:root /var/run/mta-sts
+EOF
+
+# --------------------------------------------------
+# --- Fetchmail, Getmail, Postfix & Let'sEncrypt ---
+# --------------------------------------------------
+
+# Remove invalid URL from SPF message
+# https://bugs.launchpad.net/spf-engine/+bug/1896912
+RUN echo 'Reason_Message = Message {rejectdefer} due to: {spf}.' >>/etc/postfix-policyd-spf-python/policyd-spf.conf
+
