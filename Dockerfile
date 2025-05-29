@@ -204,3 +204,135 @@ EOF
 # https://bugs.launchpad.net/spf-engine/+bug/1896912
 RUN echo 'Reason_Message = Message {rejectdefer} due to: {spf}.' >>/etc/postfix-policyd-spf-python/policyd-spf.conf
 
+COPY target/fetchmail/fetchmailrc /etc/fetchmailrc_general
+COPY target/getmail/getmailrc_general /etc/getmailrc_general
+COPY target/getmail/getmail-service.sh /usr/local/bin/
+COPY target/postfix/main.cf target/postfix/master.cf /etc/postfix/
+
+# DH parameters for DHE cipher suites, ffdhe4096 is the official standard 4096-bit DH params now part of TLS 1.3
+# This file is for TLS <1.3 handshakes that rely on DHE cipher suites
+# Handled at build to avoid failures by doveadm validating ssl_dh filepath in 10-ssl.auth (eg generate-accounts)
+COPY target/shared/ffdhe4096.pem /etc/postfix/dhparams.pem
+COPY target/shared/ffdhe4096.pem /etc/dovecot/dh.pem
+
+COPY \
+  target/postfix/header_checks.pcre \
+  target/postfix/sender_header_filter.pcre \
+  target/postfix/sender_login_maps.pcre \
+  /etc/postfix/maps/
+
+  RUN <<EOF
+  : >/etc/aliases
+  sedfile -i 's/START_DAEMON=no/START_DAEMON=yes/g' /etc/default/fetchmail
+  mkdir /var/run/fetchmail && chown fetchmail /var/run/fetchmail
+EOF
+
+# -----------------------------------------------
+# --- Logs --------------------------------------
+# -----------------------------------------------
+
+RUN <<EOF
+  sedfile -i -r "/^#?compress/c\compress\ncopytruncate" /etc/logrotate.conf
+  mkdir /var/log/mail
+  chown syslog:root /var/log/mail
+  touch /var/log/mail/clamav.log
+  chown -R clamav:root /var/log/mail/clamav.log
+  touch /var/log/mail/freshclam.log
+  chown -R clamav:root /var/log/mail/freshclam.log
+  sedfile -i -r 's|/var/log/mail|/var/log/mail/mail|g' /etc/rsyslog.conf
+  sedfile -i -r 's|;auth,authpriv.none|;mail.none;mail.error;auth,authpriv.none|g' /etc/rsyslog.conf
+  sedfile -i -r 's|LogFile /var/log/clamav/|LogFile /var/log/mail/|g' /etc/clamav/clamd.conf
+  sedfile -i -r 's|UpdateLogFile /var/log/clamav/|UpdateLogFile /var/log/mail/|g' /etc/clamav/freshclam.conf
+  sedfile -i -r 's|/var/log/clamav|/var/log/mail|g' /etc/logrotate.d/clamav-daemon
+  sedfile -i -r 's|invoke-rc.d.*|/usr/bin/supervisorctl signal hup clamav >/dev/null \|\| true|g' /etc/logrotate.d/clamav-daemon
+  sedfile -i -r 's|/var/log/clamav|/var/log/mail|g' /etc/logrotate.d/clamav-freshclam
+  sedfile -i -r '/postrotate/,/endscript/d' /etc/logrotate.d/clamav-freshclam
+  sedfile -i -r 's|/var/log/mail|/var/log/mail/mail|g' /etc/logrotate.d/rsyslog
+  sedfile -i -r '/\/var\/log\/mail\/mail.log/d' /etc/logrotate.d/rsyslog
+  sedfile -i    's|^/var/log/fail2ban.log {$|/var/log/mail/fail2ban.log {|' /etc/logrotate.d/fail2ban
+  # prevent syslog logrotate warnings
+  sedfile -i -e 's/\(printerror "could not determine current runlevel"\)/#\1/' /usr/sbin/invoke-rc.d
+  sedfile -i -e 's/^\(POLICYHELPER=\).*/\1/' /usr/sbin/invoke-rc.d
+  # prevent syslog warning about imklog permissions
+  sedfile -i -e 's/^module(load=\"imklog\")/#module(load=\"imklog\")/' /etc/rsyslog.conf
+  # this change is for our alternative process manager rather than part of
+  # a fix related to the change preceding it.
+  echo -e '\n/usr/bin/supervisorctl signal hup rsyslog >/dev/null' >>/usr/lib/rsyslog/rsyslog-rotate
+EOF 
+
+# -----------------------------------------------
+# --- Logwatch ----------------------------------
+# -----------------------------------------------
+
+COPY target/logwatch/maillog.conf /etc/logwatch/conf/logfiles/maillog.conf
+COPY target/logwatch/ignore.conf /etc/logwatch/conf/ignore.conf
+
+# -----------------------------------------------
+# --- Supervisord & Start -----------------------
+# -----------------------------------------------
+
+COPY target/supervisor/supervisord.conf /etc/supervisor/supervisord.conf
+COPY fail2ban
+/supervisor/conf.d/* /etc/supervisor/conf.d/
+
+# -----------------------------------------------
+# --- Scripts & Miscellaneous--------------------
+# -----------------------------------------------
+
+RUN <<EOF
+  rm -rf /usr/share/locale/*
+  rm -rf /usr/share/man/*
+  rm -rf /usr/share/doc/*
+  update-locale
+EOF
+
+COPY \
+  target/bin/* \
+  target/scripts/*.sh \
+  target/scripts/startup/*.sh \
+  /usr/local/bin/
+
+RUN chmod +x /usr/local/bin/*
+
+COPY target/scripts/helpers /usr/local/bin/helpers
+COPY target/scripts/startup/setup.d /usr/local/bin/setup.d
+
+#
+# Final stage focuses only on image config
+#
+
+FROM stage-main AS stage-final
+ARG DMS_RELEASE=edge
+ARG VCS_REVISION=unknown
+
+WORKDIR /
+EXPOSE 25 587 143 465 993 110 995 4190
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["supervisord", "-c", "/etc/supervisor/supervisord.conf"]
+
+# These ENVs are referenced in target/supervisor/conf.d/saslauth.conf
+# and must be present when supervisord starts. Introduced by PR:
+# https://github.com/docker-mailserver/docker-mailserver/pull/676
+# These ENV are also configured with the same defaults at:
+# https://github.com/docker-mailserver/docker-mailserver/blob/672e9cf19a3bb1da309e8cea6ee728e58f905366/target/scripts/helpers/variables.sh
+ENV FETCHMAIL_POLL=300
+ENV POSTGREY_AUTO_WHITELIST_CLIENTS=5
+ENV POSTGREY_DELAY=300
+ENV POSTGREY_MAX_AGE=35
+ENV POSTGREY_TEXT="Delayed by Postgrey"
+ENV SASLAUTHD_MECH_OPTIONS=""
+
+# Add metadata to image:
+LABEL org.opencontainers.image.title="completer-mailserver"
+LABEL org.opencontainers.image.vendor="m0rr1s"
+LABEL org.opencontainers.image.authors="m0rr1s"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.description="A fullstack but simple mail server (SMTP, IMAP, LDAP, Anti-spam, Anti-virus, etc.). Only configuration files, no SQL database."
+LABEL org.opencontainers.image.url="https://github.com/rm0rr1s/cms/tree/master"
+LABEL org.opencontainers.image.documentation="https://github.com/docker-mailserver/docker-mailserver/blob/master/README.md"
+LABEL org.opencontainers.image.source="https://github.com/docker-mailserver/docker-mailserver"
+# ARG invalidates cache when it is used by a layer (implicitly affects RUN)
+# Thus to maximize cache, keep these lines last:
+LABEL org.opencontainers.image.revision=${VCS_REVISION}
+LABEL org.opencontainers.image.version=${DMS_RELEASE}
+ENV DMS_RELEASE=${DMS_RELEASE}
